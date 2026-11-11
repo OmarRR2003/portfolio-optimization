@@ -455,13 +455,28 @@ def montecarlo(A: "Analisis", w: pd.Series, capital: float, años: float,
     return simular_montecarlo(rp, capital, años, n, rend_anual=ra), ra
 
 
+HORIZONTES = [("1 mes", 1 / 12), ("3 meses", 0.25), ("6 meses", 0.5), ("1 año", 1), ("2 años", 2),
+              ("3 años", 3), ("5 años", 5), ("7 años", 7), ("10 años", 10), ("15 años", 15)]
+
+
+def texto_horizonte(años: float) -> str:
+    """1/12 -> '1 mes', 0.5 -> '6 meses', 1 -> '1 año', 5 -> '5 años'."""
+    if años < 1:
+        m = max(1, round(años * 12))
+        return f"{m} mes" if m == 1 else f"{m} meses"
+    return "1 año" if años == 1 else f"{años:g} años"
+
+
 def resumen_montecarlo(valores: np.ndarray, capital: float, años: float,
                        rf: float) -> tuple[pd.DataFrame, pd.Series]:
-    """Escenarios por percentil y estadísticas de riesgo de la simulación."""
+    """Escenarios por percentil y estadísticas de riesgo de la simulación. El rendimiento anual
+    solo se incluye para horizontes de 1 año o más (anualizar un mes exagera los resultados)."""
     final = valores[:, -1]
     tabla = pd.DataFrame({"Valor final": {k: np.percentile(final, p) for k, p in ESCENARIOS.items()}})
     tabla["Ganancia / pérdida"] = tabla["Valor final"] - capital
-    tabla["Rend. anual"] = (tabla["Valor final"] / capital).clip(lower=1e-9) ** (1 / años) - 1
+    tabla["Rend. del periodo"] = tabla["Valor final"] / capital - 1
+    if años >= 1:
+        tabla["Rend. anual"] = (tabla["Valor final"] / capital).clip(lower=1e-9) ** (1 / años) - 1
     caidas = (valores / np.maximum.accumulate(valores, axis=1) - 1).min(axis=1)
     stats = pd.Series({
         "Probabilidad de perder dinero": (final < capital).mean(),
@@ -492,8 +507,9 @@ def comparar_montecarlo(A: "Analisis", capital: float, años: float,
 
 
 def estilo_montecarlo(tabla: pd.DataFrame):
-    return tabla.style.format({"Valor final": "${:,.0f}", "Ganancia / pérdida": "${:+,.0f}",
-                               "Rend. anual": "{:+.1%}"}).background_gradient(
+    fmt = {"Valor final": "${:,.0f}", "Ganancia / pérdida": _dinero,
+           "Rend. del periodo": "{:+.1%}", "Rend. anual": "{:+.1%}"}
+    return tabla.style.format({k: v for k, v in fmt.items() if k in tabla}).background_gradient(
         subset=["Ganancia / pérdida"], cmap="RdYlGn")
 
 
@@ -740,7 +756,8 @@ def graf_drawdown(rend_port: pd.DataFrame, bench: pd.Series | None = None,
 
 def graf_montecarlo(valores: np.ndarray, capital: float, titulo: str = ""):
     """Gráfico de abanico: bandas de escenarios en el tiempo + distribución del valor final."""
-    x = np.arange(valores.shape[1]) / DIAS
+    en_meses = valores.shape[1] - 1 < DIAS   # horizontes menores a 1 año: eje en meses
+    x = np.arange(valores.shape[1]) / DIAS * (12 if en_meses else 1)
     p5, p25, p50, p75, p95 = np.percentile(valores, [5, 25, 50, 75, 95], axis=0)
     final = valores[:, -1]
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True, layout="constrained",
@@ -752,7 +769,7 @@ def graf_montecarlo(valores: np.ndarray, capital: float, titulo: str = ""):
     ax.plot(x, p50, color="navy", lw=2.2, label="Mediana")
     ax.axhline(capital, color="crimson", ls="--", lw=1.3, label="Capital inicial")
     ax.set(title=titulo or "Simulación Monte Carlo del valor del portafolio",
-           xlabel="Años", ylabel="Valor del portafolio")
+           xlabel="Meses" if en_meses else "Años", ylabel="Valor del portafolio")
     ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.0f}"))
     ax.set_ylim(max(0, np.percentile(valores, 1) * 0.9), np.percentile(final, 98) * 1.05)
     ax.legend(fontsize=8, loc="upper left")
@@ -904,8 +921,10 @@ def lectura_montecarlo(nombre: str, tabla: pd.DataFrame, stats: pd.Series,
              "moderada" if p_perder < 0.30 else "alta")
     return _nota([
         supuesto,
-        f"Con **${capital:,.0f}** en *{nombre}* durante **{años:g} años**, el escenario típico (mediana) "
-        f"termina en **${med['Valor final']:,.0f}** ({med['Rend. anual']:+.1%} anual).",
+        f"Con **${capital:,.0f}** en *{nombre}* durante **{texto_horizonte(años)}**, el escenario típico "
+        f"(mediana) termina en **${med['Valor final']:,.0f}** ("
+        + (f"{med['Rend. anual']:+.1%} anual" if "Rend. anual" in tabla else
+           f"{med['Rend. del periodo']:+.1%} en el periodo") + ").",
         f"En el 5 % de escenarios más malos terminarías con **${pes['Valor final']:,.0f}** o menos "
         f"({_dinero(pes['Ganancia / pérdida'])}); en el 5 % más buenos, con "
         f"${opt['Valor final']:,.0f} o más.",
@@ -1202,14 +1221,15 @@ def main() -> None:
             aviso(f"No se pudo calcular la asignación discreta: {e}")
 
     capital_sim = cfg.capital or 10_000
-    titulo(f"6. SIMULACIÓN MONTE CARLO: {elegido}, ${capital_sim:,.0f} a {cfg.horizonte:g} años "
-           f"(2,000 escenarios)")
+    titulo(f"6. SIMULACIÓN MONTE CARLO: {elegido}, ${capital_sim:,.0f} a "
+           f"{texto_horizonte(cfg.horizonte)} (2,000 escenarios)")
     valores, ra = montecarlo(A, w, capital_sim, cfg.horizonte)
     print(f"Supuesto conservador: rendimiento esperado {ra:.1%} anual (CAPM, prima de mercado "
           f"{cfg.prima_mercado:.0%}), con la volatilidad y las caídas reales del historial.\n")
     mc_tabla, mc_stats = resumen_montecarlo(valores, capital_sim, cfg.horizonte, rf)
     print(mc_tabla.to_string(formatters={"Valor final": "${:,.0f}".format,
                                          "Ganancia / pérdida": _dinero,
+                                         "Rend. del periodo": "{:+.1%}".format,
                                          "Rend. anual": "{:+.1%}".format}))
     print()
     for k, v in mc_stats.items():
@@ -1245,7 +1265,7 @@ def main() -> None:
                 oos.rendimientos, oos.benchmark, "Fuera de muestra: crecimiento de 100")
             figuras["07_drawdown.png"] = graf_drawdown(oos.rendimientos, oos.benchmark)
         figuras["08_montecarlo.png"] = graf_montecarlo(
-            valores, capital_sim, f"{elegido}: {cfg.horizonte:g} años, ${capital_sim:,.0f}")
+            valores, capital_sim, f"{elegido}: {texto_horizonte(cfg.horizonte)}, ${capital_sim:,.0f}")
         for nombre, fig in figuras.items():
             fig.savefig(cfg.salida / nombre, dpi=130)
             plt.close(fig)
