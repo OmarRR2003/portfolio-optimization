@@ -4,6 +4,7 @@
 # Estándar
 import argparse
 import os
+import re
 import sys
 import warnings
 from dataclasses import dataclass, field, replace

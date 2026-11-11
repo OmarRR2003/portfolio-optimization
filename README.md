@@ -22,6 +22,9 @@ diversificación, 7 estrategias de construcción y **validación fuera de muestr
 - **Estimación robusta:** covarianza con *shrinkage* de Ledoit-Wolf, límites de peso y regularización L2.
 - **7 estrategias:** igual peso, inversa volatilidad, paridad de riesgo, mínima volatilidad, máximo Sharpe, mínimo CVaR y HRP (*Hierarchical Risk Parity*).
 - **Validación fuera de muestra** con rebalanceo periódico frente al benchmark (SPY).
+- **Tu portafolio actual:** escribe cuántas acciones tienes de cada empresa (`AAPL: 10, KO: 25`) y obtén
+  su valor, diversificación real, contribución al riesgo, comparación con las estrategias y un plan de
+  rebalanceo en acciones enteras (qué comprar y qué vender), con o sin dinero nuevo.
 - **Simulación Monte Carlo de escenarios futuros:** 2,000 trayectorias por *block bootstrap* con un supuesto
   de rendimiento conservador (CAPM): escenarios pesimista/mediano/optimista en dinero, probabilidad de perder
   y caída esperada en el camino, para el horizonte y capital que elijas.
@@ -49,6 +52,7 @@ pip install -r requirements.txt
 jupyter notebook acciones.ipynb                    # notebook
 voila acciones.ipynb                               # como app web, sin código
 python acciones.py AAPL MSFT KO XOM --capital 10000   # reporte en terminal + CSV y gráficos
+python acciones.py MSFT --posiciones "AAPL: 10, KO: 25"  # incluye tu portafolio actual
 python acciones.py --help                          # todas las opciones
 ```
 

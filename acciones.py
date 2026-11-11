@@ -17,7 +17,7 @@ Se usa de dos formas:
 from libs import (
     DiscreteAllocation, EfficientCVaR, EfficientFrontier, Path, argparse, dataclass, date,
     Markdown, capture_output, display, expected_returns, field, leaves_list, linkage, minimize, mticker, np,
-    objective_functions, os, pd, plt, replace, risk_models, squareform, sys, timedelta, widgets, yf,
+    objective_functions, os, pd, plt, re, replace, risk_models, squareform, sys, timedelta, widgets, yf,
 )
 
 DIAS = 252  # días hábiles por año
@@ -25,7 +25,7 @@ REBALANCEOS = {"diario": "D", "mensual": "ME", "trimestral": "QE", "anual": "YE"
 PCT = {
     "Rend. total", "Rend. anual (CAGR)", "Volatilidad", "Máx. drawdown", "VaR 95% diario",
     "CVaR 95% diario", "Alfa anual", "Tracking error", "% días positivos",
-    "Rend. esperado", "Volatilidad esperada",
+    "Rend. esperado", "Volatilidad esperada", "Máx. drawdown histórico",
 }
 
 
@@ -49,6 +49,7 @@ class Config:
     min_cobertura: float = 0.90
     horizonte: float = 5             # años a simular en el Monte Carlo
     prima_mercado: float = 0.05      # prima de riesgo del mercado para el supuesto conservador
+    posiciones: dict | str | None = None   # tus acciones actuales: "AAPL: 10, KO: 25" o dict
 
     def __post_init__(self):
         if isinstance(self.tickers, str):
@@ -56,6 +57,9 @@ class Config:
         tickers = []
         for t in self.tickers:
             tickers += [x.strip().upper() for x in t.split(",") if x.strip()]
+        self.posiciones = parsear_posiciones(self.posiciones) or None
+        if self.posiciones:   # las empresas que ya tienes entran al análisis
+            tickers += list(self.posiciones)
         self.tickers = list(dict.fromkeys(tickers))
         if not self.tickers:
             raise ValueError("Debes indicar al menos un ticker.")
@@ -69,6 +73,40 @@ class Config:
         if self.rebalanceo not in REBALANCEOS:
             raise ValueError(f"rebalanceo debe ser uno de {list(REBALANCEOS)}")
         self.salida = Path(self.salida)
+
+
+MI_PORTAFOLIO = "Mi portafolio"
+
+
+def parsear_posiciones(texto) -> dict[str, float]:
+    """'AAPL: 10, KO: 25' / 'AAPL=10; KO 25' / dict -> {'AAPL': 10.0, 'KO': 25.0}.
+    Separa posiciones con coma, punto y coma o salto de línea; decimales con punto."""
+    if texto is None:
+        return {}
+    if isinstance(texto, dict):
+        pares = list(texto.items())
+    else:
+        pares = []
+        for parte in re.split(r"[,;\n]+", str(texto)):
+            parte = parte.strip()
+            if not parte:
+                continue
+            m = re.fullmatch(r"([A-Za-z0-9.\-^=]+?)\s*(?::|=|\s)\s*([0-9]+(?:\.[0-9]+)?)", parte)
+            if not m:
+                raise ValueError(f"No entiendo '{parte}'. Usa el formato TICKER: cantidad, p. ej. 'AAPL: 10'.")
+            pares.append((m.group(1), m.group(2)))
+    posiciones: dict[str, float] = {}
+    for t, q in pares:
+        q = float(q)
+        if q < 0:
+            raise ValueError(f"La cantidad de {t} no puede ser negativa.")
+        t = str(t).strip().upper()
+        posiciones[t] = posiciones.get(t, 0.0) + q
+    return {t: q for t, q in posiciones.items() if q > 0}
+
+
+def texto_posiciones(posiciones: dict | None) -> str:
+    return ", ".join(f"{t}: {q:g}" for t, q in (posiciones or {}).items())
 
 
 # =========================================================================== utilidades
@@ -543,8 +581,10 @@ class FueraDeMuestra:
 
 
 def validar_fuera_de_muestra(precios: pd.DataFrame, bench: pd.Series | None,
-                             cfg: Config, rf: float) -> FueraDeMuestra | None:
-    """Optimiza con el primer (1 - test) del periodo y evalúa en el resto."""
+                             cfg: Config, rf: float,
+                             extra: dict[str, pd.Series] | None = None) -> FueraDeMuestra | None:
+    """Optimiza con el primer (1 - test) del periodo y evalúa en el resto.
+    `extra`: portafolios con pesos fijos que se evalúan igual (p. ej., el tuyo actual)."""
     if cfg.test <= 0:
         return None
     corte = int(len(precios) * (1 - cfg.test))
@@ -553,7 +593,7 @@ def validar_fuera_de_muestra(precios: pd.DataFrame, bench: pd.Series | None,
               "entrenamiento y ≥ 60 días de prueba). Se omite.")
         return None
     p_train, p_test = precios.iloc[:corte], precios.iloc[corte - 1:]
-    pesos = construir_portafolios(p_train, bench, cfg, rf)
+    pesos = {**(extra or {}), **construir_portafolios(p_train, bench, cfg, rf)}
     r_test = rendimientos(p_test)
     rend = simular_todos(r_test, pesos, cfg.rebalanceo)
     b = rendimientos(bench).reindex(r_test.index).dropna() if bench is not None else None
@@ -571,10 +611,121 @@ def validar_fuera_de_muestra(precios: pd.DataFrame, bench: pd.Series | None,
 def elegir_sugerido(pesos: dict[str, pd.Series], oos: FueraDeMuestra | None,
                     ex_ante: pd.DataFrame) -> tuple[str, str]:
     if oos is not None:
-        candidatos = [n for n in oos.metricas.index if n in pesos]
+        candidatos = [n for n in oos.metricas.index if n in pesos and n != MI_PORTAFOLIO]
         if candidatos:
             return candidatos[0], "mejor Sharpe fuera de muestra"
-    return ex_ante["Sharpe"].idxmax(), "mejor Sharpe esperado (sin validación fuera de muestra)"
+    sharpe = ex_ante["Sharpe"].drop(MI_PORTAFOLIO, errors="ignore")
+    return sharpe.idxmax(), "mejor Sharpe esperado (sin validación fuera de muestra)"
+
+
+# =========================================================================== tu portafolio actual
+
+def valorar_posiciones(posiciones: dict[str, float], precios: pd.DataFrame):
+    """Valor y peso actual de tus acciones. Devuelve (tabla, pesos) o (None, None)."""
+    fuera = [t for t in posiciones if t not in precios.columns]
+    for t in fuera:
+        aviso(f"No hay datos válidos de '{t}': se excluye de tu portafolio.")
+    pos = {t: q for t, q in posiciones.items() if t in precios.columns}
+    if not pos:
+        return None, None
+    ultimos = precios.iloc[-1]
+    tabla = pd.DataFrame({"Acciones": pd.Series(pos, dtype=float)})
+    tabla["Precio"] = ultimos[tabla.index]
+    tabla["Valor"] = tabla["Acciones"] * tabla["Precio"]
+    tabla["Peso"] = tabla["Valor"] / tabla["Valor"].sum()
+    w = tabla["Peso"].reindex(precios.columns).fillna(0.0)
+    return tabla.sort_values("Valor", ascending=False), w
+
+
+def plan_rebalanceo(posiciones: dict[str, float], w_objetivo: pd.Series, precios: pd.DataFrame,
+                    aporte: float = 0.0):
+    """Operaciones para pasar de tus acciones actuales a los pesos objetivo, en acciones enteras.
+    `aporte` > 0 agrega dinero nuevo; < 0 retira. Devuelve (tabla, resumen)."""
+    ultimos = precios.iloc[-1]
+    tienes = pd.Series(posiciones, dtype=float).reindex(precios.columns).fillna(0.0)
+    valor_actual = float((tienes * ultimos).sum())
+    total = valor_actual + aporte
+    if total <= 0:
+        raise ValueError("El retiro no puede ser mayor que el valor de tu portafolio.")
+    w = w_objetivo[w_objetivo > 0]
+    asignacion, sobrante = DiscreteAllocation(
+        w.to_dict(), ultimos[w.index], total_portfolio_value=total).greedy_portfolio()
+    objetivo = pd.Series(asignacion, dtype=float).reindex(precios.columns).fillna(0.0)
+    tabla = pd.DataFrame({"Tienes": tienes, "Objetivo": objetivo, "Precio": ultimos})
+    tabla["Operación"] = tabla["Objetivo"] - tabla["Tienes"]
+    tabla["Monto"] = tabla["Operación"] * tabla["Precio"]
+    tabla["Peso actual"] = tienes * ultimos / valor_actual if valor_actual > 0 else 0.0
+    tabla["Peso objetivo"] = w_objetivo.reindex(tabla.index).fillna(0.0)
+    tabla = tabla[(tabla["Tienes"] > 0) | (tabla["Objetivo"] > 0)].sort_values("Monto")
+    resumen = pd.Series({
+        "Valor actual de tus acciones": valor_actual,
+        "Dinero nuevo (aporte)": aporte,
+        "Total a vender": -tabla.loc[tabla["Monto"] < 0, "Monto"].sum(),
+        "Total a comprar": tabla.loc[tabla["Monto"] > 0, "Monto"].sum(),
+        "Efectivo sobrante": sobrante,
+    })
+    return tabla, resumen
+
+
+def _cantidad(q: float) -> str:
+    if abs(q) < 1e-9:
+        return "-"
+    signo = "Comprar " if q > 0 else "Vender "
+    return signo + (f"{abs(q):,.0f}" if float(q).is_integer() else f"{abs(q):,.4g}")
+
+
+def estilo_rebalanceo(tabla: pd.DataFrame):
+    def color(v):
+        return ("color: #1a7f37; font-weight: bold" if v > 0 else
+                "color: #c0392b; font-weight: bold" if v < 0 else "")
+    return (tabla.style
+            .format({"Tienes": "{:g}", "Objetivo": "{:g}", "Precio": "${:,.2f}", "Operación": _cantidad,
+                     "Monto": _dinero, "Peso actual": "{:.1%}", "Peso objetivo": "{:.1%}"})
+            .map(color, subset=["Operación", "Monto"]))
+
+
+def estilo_resumen_rebalanceo(resumen: pd.Series):
+    return pd.DataFrame({"": {k: f"${v:,.2f}" for k, v in resumen.items()}}).style.set_table_styles(
+        [{"selector": "th.col_heading", "props": "display: none;"}])
+
+
+def estilo_posiciones(tabla: pd.DataFrame):
+    return tabla.style.format({"Acciones": "{:g}", "Precio": "${:,.2f}", "Valor": "${:,.2f}",
+                               "Peso": "{:.1%}"}).bar(subset=["Peso"], color="#9ecae1", vmin=0, vmax=1)
+
+
+def comparar_mi_portafolio(A: "Analisis") -> pd.DataFrame:
+    """Tu portafolio frente al sugerido, igual peso y el benchmark."""
+    nombres = [MI_PORTAFOLIO, A.elegido] + (["Igual peso"] if A.elegido != "Igual peso" else [])
+    filas = {}
+    for n in nombres:
+        f = {
+            "Volatilidad esperada": A.ex_ante.loc[n, "Volatilidad esperada"],
+            "Sharpe esperado": A.ex_ante.loc[n, "Sharpe"],
+            "Activos efectivos": A.ex_ante.loc[n, "Activos efectivos"],
+            "Sharpe histórico": A.met_hist.loc[n, "Sharpe"],
+            "Máx. drawdown histórico": A.met_hist.loc[n, "Máx. drawdown"],
+        }
+        if A.oos is not None and n in A.oos.metricas.index:
+            f["Sharpe fuera de muestra"] = A.oos.metricas.loc[n, "Sharpe"]
+        filas[n if n != A.elegido else f"{n} (sugerido)"] = f
+    if A.bench is not None:
+        b = f"[{A.bench.name}]"
+        filas[b] = {"Volatilidad esperada": A.met_activos.loc[b, "Volatilidad"],
+                    "Sharpe histórico": A.met_activos.loc[b, "Sharpe"],
+                    "Máx. drawdown histórico": A.met_activos.loc[b, "Máx. drawdown"]}
+        if A.oos is not None and b in A.oos.metricas.index:
+            filas[b]["Sharpe fuera de muestra"] = A.oos.metricas.loc[b, "Sharpe"]
+    return pd.DataFrame(filas).T
+
+
+def estilo_comparar_mi(df: pd.DataFrame):
+    fmt = {c: ("{:.1%}" if ("Volatilidad" in c or "drawdown" in c) else "{:.2f}") for c in df.columns}
+    st = df.style.format(fmt, na_rep="-")
+    for c in ("Sharpe esperado", "Sharpe histórico", "Sharpe fuera de muestra"):
+        if c in df.columns:
+            st = st.background_gradient(subset=[c], cmap="RdYlGn")
+    return st
 
 
 def asignacion_discreta(w: pd.Series, precios: pd.DataFrame, capital: float):
@@ -855,6 +1006,8 @@ def lectura_correlacion(corr: pd.DataFrame) -> str:
 
 
 def lectura_pesos(pesos: dict[str, pd.Series], ex_ante: pd.DataFrame) -> str:
+    pesos = {k: v for k, v in pesos.items() if k != MI_PORTAFOLIO}
+    ex_ante = ex_ante.drop(MI_PORTAFOLIO, errors="ignore")
     tabla = pd.DataFrame(pesos)
     conc = ex_ante["Activos efectivos"].idxmin()
     t, e = tabla.stack().idxmax()
@@ -869,7 +1022,7 @@ def lectura_pesos(pesos: dict[str, pd.Series], ex_ante: pd.DataFrame) -> str:
 
 def lectura_oos(oos: FueraDeMuestra, met_hist: pd.DataFrame | None = None) -> str:
     met = oos.metricas
-    estr = met[~met.index.str.startswith("[")]
+    estr = met[~met.index.str.startswith("[") & (met.index != MI_PORTAFOLIO)]
     gan = estr.index[0]
     l = [f"Ganadora fuera de muestra: **{gan}** (Sharpe {estr.loc[gan, 'Sharpe']:.2f}, "
          f"CAGR {estr.loc[gan, 'Rend. anual (CAGR)']:.1%}, peor caída {estr.loc[gan, 'Máx. drawdown']:.1%})."]
@@ -882,7 +1035,7 @@ def lectura_oos(oos: FueraDeMuestra, met_hist: pd.DataFrame | None = None) -> st
         l.append(f"La diferencia de Sharpe entre la mejor y la peor es solo {rango:.2f}: "
                  f"probablemente **ninguna es claramente superior** (podría ser azar).")
     if met_hist is not None and "Máximo Sharpe" in estr.index and "Máximo Sharpe" in met_hist.index:
-        pos_in = met_hist["Sharpe"].rank(ascending=False)["Máximo Sharpe"]
+        pos_in = met_hist["Sharpe"].drop(MI_PORTAFOLIO, errors="ignore").rank(ascending=False)["Máximo Sharpe"]
         pos_out = estr["Sharpe"].rank(ascending=False)["Máximo Sharpe"]
         l.append(f"*Máximo Sharpe* quedó #{pos_in:.0f} dentro de muestra y **#{pos_out:.0f}** fuera de muestra"
                  + (": señal de sobreajuste." if pos_out > pos_in else "."))
@@ -900,6 +1053,32 @@ def lectura_final(nombre: str, w: pd.Series, S: pd.DataFrame) -> str:
         l.append("Cada acción aporta prácticamente el mismo riesgo: el riesgo está bien repartido.")
     elif cr.max() > 0.4:
         l.append(f"Una sola acción concentra más del 40 % del riesgo: el portafolio depende mucho de {t_r}.")
+    return _nota(l)
+
+
+def lectura_mi_portafolio(A: "Analisis") -> str:
+    w = A.pesos[MI_PORTAFOLIO]
+    pos = A.posiciones
+    cr = contribucion_riesgo(w, A.S)
+    efectivos = 1 / float((w ** 2).sum())
+    top = pos["Peso"].idxmax()
+    l = [f"Valor actual: **${pos['Valor'].sum():,.2f}** en {len(pos)} empresas, "
+         f"equivalente a **{efectivos:.1f}** empresas a igual peso.",
+         f"Tu mayor posición es **{top}** ({pos.loc[top, 'Peso']:.0%} del dinero). "
+         f"Tu mayor fuente de riesgo es **{cr.idxmax()}** ({cr.max():.0%} del riesgo)."]
+    if cr.max() > 0.4:
+        l.append(f"Más del 40 % de tu riesgo depende de {cr.idxmax()}: estás **poco diversificado**.")
+    estr = [n for n in A.pesos if n != MI_PORTAFOLIO]
+    vol = A.ex_ante.loc[MI_PORTAFOLIO, "Volatilidad esperada"]
+    vol_min = A.ex_ante.loc[estr, "Volatilidad esperada"].min()
+    l.append(f"Tu volatilidad esperada es {vol:.1%}; con estas mismas empresas se puede bajar hasta "
+             f"{vol_min:.1%} (estrategia de menor riesgo).")
+    if A.oos is not None and MI_PORTAFOLIO in A.oos.metricas.index:
+        m = A.oos.metricas
+        ranking = m[~m.index.str.startswith("[")]["Sharpe"].rank(ascending=False)
+        l.append(f"Fuera de muestra, tus pesos actuales quedaron **#{ranking[MI_PORTAFOLIO]:.0f} de "
+                 f"{len(ranking)}** en Sharpe ({m.loc[MI_PORTAFOLIO, 'Sharpe']:.2f} vs. "
+                 f"{m.loc[A.elegido, 'Sharpe']:.2f} de *{A.elegido}*).")
     return _nota(l)
 
 
@@ -957,6 +1136,7 @@ class Analisis:
     oos: FueraDeMuestra | None
     elegido: str
     motivo: str
+    posiciones: pd.DataFrame | None = None   # tus acciones valoradas (si las indicaste)
 
     @property
     def w(self) -> pd.Series:
@@ -979,12 +1159,18 @@ def analizar(cfg: Config) -> Analisis:
     mu, S = estimar_mu_S(precios, bench, cfg, rf)
     _, S_muestral = estimar_mu_S(precios, bench, replace(cfg, cov="muestral"), rf)
     pesos = construir_portafolios(precios, bench, cfg, rf)
+    posiciones, extra = None, {}
+    if cfg.posiciones:
+        posiciones, w_actual = valorar_posiciones(cfg.posiciones, precios)
+        if w_actual is not None:
+            extra = {MI_PORTAFOLIO: w_actual}
+            pesos = {**extra, **pesos}
     ex_ante = desempeño_ex_ante(pesos, mu, S, rf)
     met_hist = tabla_metricas(simular_todos(rend, pesos, cfg.rebalanceo), rf, bench_rend)
-    oos = validar_fuera_de_muestra(precios, bench, cfg, rf)
+    oos = validar_fuera_de_muestra(precios, bench, cfg, rf, extra)
     elegido, motivo = elegir_sugerido(pesos, oos, ex_ante)
     return Analisis(cfg, precios, bench, rf, rend, bench_rend, met_activos, rend.corr(), mu, S,
-                    S_muestral, pesos, ex_ante, met_hist, oos, elegido, motivo)
+                    S_muestral, pesos, ex_ante, met_hist, oos, elegido, motivo, posiciones)
 
 
 # =========================================================================== notebook / app
@@ -1073,6 +1259,10 @@ class Tablero:
         tickers = widgets.Textarea(
             value=", ".join(cfg.tickers), placeholder="Ej.: AAPL, MSFT, KO, XOM",
             description="Acciones", layout=widgets.Layout(width="95%", height="60px"))
+        mis_acciones = widgets.Textarea(
+            value=texto_posiciones(cfg.posiciones),
+            placeholder="Opcional. Ej.: AAPL: 10, KO: 25, NVDA: 3.5",
+            description="Mis acciones", layout=widgets.Layout(width="95%", height="50px"))
         inicio = widgets.DatePicker(value=date.fromisoformat(cfg.inicio), description="Desde")
         benchmark = widgets.Text(value=cfg.benchmark or "", description="Benchmark",
                                  placeholder="SPY (vacío = ninguno)")
@@ -1091,7 +1281,8 @@ class Tablero:
                         raise ValueError("Elige una fecha de inicio.")
                     nuevo = replace(self.A.cfg, tickers=[tickers.value],
                                     inicio=str(inicio.value), benchmark=benchmark.value or None,
-                                    capital=capital.value or None)
+                                    capital=capital.value or None,
+                                    posiciones=mis_acciones.value or None)
                     if len(nuevo.tickers) > MAX_TICKERS:
                         raise ValueError(f"Máximo {MAX_TICKERS} acciones.")
                     self.analizar(nuevo)
@@ -1110,8 +1301,11 @@ class Tablero:
         boton.on_click(al_pulsar)
         ayuda = widgets.HTML(
             "<b>Escribe las acciones que quieras analizar</b> (símbolos de Yahoo Finance, separados "
-            "por coma) y pulsa <i>Analizar</i>. La descarga y optimización tarda entre 10 y 60 s.")
-        return widgets.VBox([ayuda, tickers,
+            "por coma) y pulsa <i>Analizar</i>. La descarga y optimización tarda entre 10 y 60 s.<br>"
+            "<b>Mis acciones</b> (opcional): cuántas acciones tienes hoy de cada empresa, para analizar "
+            "tu portafolio actual y ver qué comprar o vender. Las empresas que pongas ahí se agregan "
+            "solas al análisis.")
+        return widgets.VBox([ayuda, tickers, mis_acciones,
                              widgets.HBox([inicio, benchmark, capital]),
                              boton, estado],
                             layout=widgets.Layout(border="1px solid #ccc", padding="10px"))
@@ -1151,11 +1345,13 @@ def parsear_args() -> Config:
                    help="Años a simular en el Monte Carlo")
     p.add_argument("--prima-mercado", type=float, default=d.prima_mercado,
                    help="Prima de riesgo del mercado para el supuesto conservador del Monte Carlo")
+    p.add_argument("--posiciones", default=None,
+                   help="Tus acciones actuales, p. ej. 'AAPL: 10, KO: 25' (se agregan al análisis)")
     a = p.parse_args()
     try:
         cfg = Config(a.tickers, a.inicio, a.fin, a.benchmark, a.rf, a.max_peso, a.mu, a.cov,
                      a.gamma, a.test, a.rebalanceo, a.capital, Path(a.salida), a.min_cobertura,
-                     a.horizonte, a.prima_mercado)
+                     a.horizonte, a.prima_mercado, a.posiciones)
     except ValueError as e:
         p.error(str(e))
     cfg.graficos = not a.sin_graficos
@@ -1220,8 +1416,25 @@ def main() -> None:
         except Exception as e:
             aviso(f"No se pudo calcular la asignación discreta: {e}")
 
+    if A.posiciones is not None:
+        titulo("6. TU PORTAFOLIO ACTUAL")
+        print(A.posiciones.to_string(formatters={"Acciones": "{:g}".format, "Precio": "${:,.2f}".format,
+                                                 "Valor": "${:,.2f}".format, "Peso": "{:.1%}".format}))
+        print()
+        print(formatear(comparar_mi_portafolio(A)).to_string())
+        print("\n" + re.sub(r"\*", "", lectura_mi_portafolio(A)).replace("> ", "").replace(">", ""))
+        plan, resumen = plan_rebalanceo(cfg.posiciones, w, precios)
+        print(f"\nPlan para pasar a '{elegido}' (sin dinero nuevo):\n")
+        print(plan.to_string(formatters={"Tienes": "{:g}".format, "Objetivo": "{:g}".format,
+                                         "Precio": "${:,.2f}".format, "Operación": _cantidad,
+                                         "Monto": _dinero, "Peso actual": "{:.1%}".format,
+                                         "Peso objetivo": "{:.1%}".format}))
+        for k, v in resumen.items():
+            print(f"  {k:<30} ${v:,.2f}")
+        plan.to_csv(cfg.salida / "plan_rebalanceo.csv")
+
     capital_sim = cfg.capital or 10_000
-    titulo(f"6. SIMULACIÓN MONTE CARLO: {elegido}, ${capital_sim:,.0f} a "
+    titulo(f"{7 if A.posiciones is not None else 6}. SIMULACIÓN MONTE CARLO: {elegido}, ${capital_sim:,.0f} a "
            f"{texto_horizonte(cfg.horizonte)} (2,000 escenarios)")
     valores, ra = montecarlo(A, w, capital_sim, cfg.horizonte)
     print(f"Supuesto conservador: rendimiento esperado {ra:.1%} anual (CAPM, prima de mercado "
