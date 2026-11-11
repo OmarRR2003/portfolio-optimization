@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import ipywidgets as widgets
 from IPython.display import Markdown, display
+from IPython.utils.capture import capture_output
 
 # Silenciar avisos internos de yfinance/pypfopt que no afectan los resultados
 warnings.filterwarnings("ignore", message=".*inplace keyword.*")

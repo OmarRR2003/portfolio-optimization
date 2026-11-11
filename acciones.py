@@ -16,7 +16,7 @@ Se usa de dos formas:
 
 from libs import (
     DiscreteAllocation, EfficientCVaR, EfficientFrontier, Path, argparse, dataclass, date,
-    Markdown, display, expected_returns, field, leaves_list, linkage, minimize, mticker, np,
+    Markdown, capture_output, display, expected_returns, field, leaves_list, linkage, minimize, mticker, np,
     objective_functions, os, pd, plt, replace, risk_models, squareform, sys, timedelta, widgets, yf,
 )
 
@@ -837,14 +837,36 @@ class Tablero:
 
     @staticmethod
     def _dibujar(out, fn) -> None:
-        out.clear_output(wait=True)
-        with out:
+        # No se usa `with out:`: mientras Voilà ejecuta el notebook, esa captura del widget
+        # Output se cuelga de forma intermitente (siempre con Markdown). En su lugar se captura
+        # la salida con IPython y se asigna al widget de una vez.
+        with capture_output() as cap:
             try:
                 fn()
                 plt.show()
             except Exception as e:
                 plt.close("all")
                 print(f"No se pudo mostrar esta sección: {e}")
+        salidas = []
+        if cap.stdout:
+            salidas.append({"output_type": "stream", "name": "stdout", "text": cap.stdout})
+        salidas += [{"output_type": "display_data", "data": o.data, "metadata": o.metadata}
+                    for o in cap.outputs]
+        out.outputs = tuple(salidas)
+
+    @staticmethod
+    def interactivo(fn, **controles):
+        """Equivalente a `widgets.interact` compatible con Voilà: vuelve a ejecutar `fn` con los
+        valores de los controles cada vez que cambian y muestra el resultado debajo."""
+        resultado = widgets.Output()
+
+        def actualizar(_=None):
+            Tablero._dibujar(resultado, lambda: fn(**{k: c.value for k, c in controles.items()}))
+
+        for c in controles.values():
+            c.observe(actualizar, names="value")
+        actualizar()
+        return widgets.VBox([widgets.VBox(list(controles.values())), resultado])
 
     # ---- panel de control
     def panel(self):
