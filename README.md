@@ -5,8 +5,8 @@ diversificación, 7 estrategias de construcción y **validación fuera de muestr
 
 | | |
 |---|---|
-| **App interactiva** (sin código, en el navegador) | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/TU_USUARIO/TU_REPO/main?urlpath=voila%2Frender%2Facciones.ipynb) |
-| **Notebook con código** (solo lectura, carga rápida) | [![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.org/github/TU_USUARIO/TU_REPO/blob/main/acciones.ipynb) |
+| **App interactiva** (sin código, en el navegador) | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/OmarRR2003/portfolio-optimization/main?urlpath=voila%2Frender%2Facciones.ipynb) |
+| **Notebook con código** (solo lectura, carga rápida) | [![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.org/github/OmarRR2003/portfolio-optimization/blob/main/acciones.ipynb) |
 
 > La app interactiva tarda 1–3 minutos en abrir la primera vez (Binder prepara el entorno y descarga los datos).
 
@@ -14,6 +14,8 @@ diversificación, 7 estrategias de construcción y **validación fuera de muestr
 
 ## Qué incluye
 
+- **Panel para elegir acciones:** en la app, cualquier persona escribe sus propios tickers, fecha de inicio,
+  benchmark y capital, pulsa *Analizar*, y todo el análisis se recalcula.
 - **Datos:** precios ajustados de Yahoo Finance, limpieza automática (tickers inválidos, historiales cortos, huecos).
 - **Métricas por activo:** CAGR, volatilidad, Sharpe, Sortino, máximo drawdown, Calmar, VaR/CVaR, asimetría, curtosis, beta, alfa, information ratio.
 - **Diversificación:** matriz de correlación y pares más y menos correlacionados.

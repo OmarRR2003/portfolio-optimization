@@ -16,8 +16,8 @@ Se usa de dos formas:
 
 from libs import (
     DiscreteAllocation, EfficientCVaR, EfficientFrontier, Path, argparse, dataclass, date,
-    expected_returns, field, leaves_list, linkage, minimize, mticker, np, objective_functions,
-    pd, plt, risk_models, squareform, sys, timedelta, yf,
+    Markdown, display, expected_returns, field, leaves_list, linkage, minimize, mticker, np,
+    objective_functions, os, pd, plt, replace, risk_models, squareform, sys, timedelta, widgets, yf,
 )
 
 DIAS = 252  # días hábiles por año
@@ -737,6 +737,166 @@ def lectura_final(nombre: str, w: pd.Series, S: pd.DataFrame) -> str:
     return _nota(l)
 
 
+# =========================================================================== análisis completo
+
+@dataclass
+class Analisis:
+    """Todos los resultados de un análisis, en un solo objeto."""
+    cfg: Config
+    precios: pd.DataFrame
+    bench: pd.Series | None
+    rf: float
+    rend: pd.DataFrame
+    bench_rend: pd.Series | None
+    met_activos: pd.DataFrame          # incluye el benchmark como fila "[SPY]"
+    corr: pd.DataFrame
+    mu: pd.Series
+    S: pd.DataFrame                    # covarianza según cfg.cov
+    S_muestral: pd.DataFrame           # para comparar con Ledoit-Wolf
+    pesos: dict[str, pd.Series]        # calculados con todo el historial
+    ex_ante: pd.DataFrame
+    met_hist: pd.DataFrame             # desempeño dentro de muestra
+    oos: FueraDeMuestra | None
+    elegido: str
+    motivo: str
+
+    @property
+    def w(self) -> pd.Series:
+        """Pesos del portafolio sugerido."""
+        return self.pesos[self.elegido]
+
+
+def analizar(cfg: Config) -> Analisis:
+    """Ejecuta el análisis completo: datos, métricas, estrategias y validación."""
+    precios, bench = preparar_precios(cfg)
+    rf = tasa_libre_riesgo(cfg)
+    rend = rendimientos(precios)
+    bench_rend = rendimientos(bench) if bench is not None else None
+
+    tabla = rend.copy()
+    if bench_rend is not None:
+        tabla[f"[{bench.name}]"] = bench_rend
+    met_activos = tabla_metricas(tabla, rf, bench_rend)
+
+    mu, S = estimar_mu_S(precios, bench, cfg, rf)
+    _, S_muestral = estimar_mu_S(precios, bench, replace(cfg, cov="muestral"), rf)
+    pesos = construir_portafolios(precios, bench, cfg, rf)
+    ex_ante = desempeño_ex_ante(pesos, mu, S, rf)
+    met_hist = tabla_metricas(simular_todos(rend, pesos, cfg.rebalanceo), rf, bench_rend)
+    oos = validar_fuera_de_muestra(precios, bench, cfg, rf)
+    elegido, motivo = elegir_sugerido(pesos, oos, ex_ante)
+    return Analisis(cfg, precios, bench, rf, rend, bench_rend, met_activos, rend.corr(), mu, S,
+                    S_muestral, pesos, ex_ante, met_hist, oos, elegido, motivo)
+
+
+# =========================================================================== notebook / app
+
+MAX_TICKERS = 30  # límite del panel para que la app pública no se sature
+
+
+def en_voila() -> bool:
+    """True si el notebook se está mostrando como app con Voilà (Voilà define estas variables)."""
+    return "VOILA_SERVER_URL" in os.environ or "VOILA_BASE_URL" in os.environ
+
+
+class Tablero:
+    """Coordina el panel de control y las secciones del notebook.
+
+    * Modo app (Voilà): cada sección vive en un widget Output y se vuelve a dibujar cuando
+      el visitante pulsa "Analizar" con otras acciones.
+    * Modo notebook (Jupyter, GitHub, nbviewer): las secciones se dibujan de forma normal,
+      así los resultados quedan guardados en el archivo y se ven sin ejecutar nada.
+    """
+
+    def __init__(self, interactivo: bool | None = None):
+        self.interactivo = en_voila() if interactivo is None else interactivo
+        self.A: Analisis | None = None
+        self._secciones: list = []
+        self._boton = None
+
+    def analizar(self, cfg: Config) -> Analisis:
+        self.A = analizar(cfg)
+        return self.A
+
+    # ---- secciones
+    def seccion(self, fn):
+        """Decorador: registra una función que dibuja una sección usando `self.A`."""
+        if self.interactivo:
+            out = widgets.Output()
+            self._secciones.append((out, fn))
+            display(out)
+            self._dibujar(out, fn)
+        else:
+            fn()
+            plt.show()
+        return fn
+
+    def redibujar(self) -> None:
+        for out, fn in self._secciones:
+            self._dibujar(out, fn)
+
+    @staticmethod
+    def _dibujar(out, fn) -> None:
+        out.clear_output(wait=True)
+        with out:
+            try:
+                fn()
+                plt.show()
+            except Exception as e:
+                plt.close("all")
+                print(f"No se pudo mostrar esta sección: {e}")
+
+    # ---- panel de control
+    def panel(self):
+        cfg = self.A.cfg
+        ancho = widgets.Layout(width="95%")
+        tickers = widgets.Textarea(
+            value=", ".join(cfg.tickers), placeholder="Ej.: AAPL, MSFT, KO, XOM",
+            description="Acciones", layout=widgets.Layout(width="95%", height="60px"))
+        inicio = widgets.DatePicker(value=date.fromisoformat(cfg.inicio), description="Desde")
+        benchmark = widgets.Text(value=cfg.benchmark or "", description="Benchmark",
+                                 placeholder="SPY (vacío = ninguno)")
+        capital = widgets.FloatText(value=cfg.capital or 0, description="Capital ($)")
+        boton = widgets.Button(description="Analizar", button_style="primary", icon="play",
+                               layout=widgets.Layout(width="160px"))
+        estado = widgets.Output(layout=ancho)
+        self._boton = boton
+
+        def al_pulsar(_):
+            boton.disabled, boton.description = True, "Analizando..."
+            estado.clear_output()
+            with estado:
+                try:
+                    if inicio.value is None:
+                        raise ValueError("Elige una fecha de inicio.")
+                    nuevo = replace(self.A.cfg, tickers=[tickers.value],
+                                    inicio=str(inicio.value), benchmark=benchmark.value or None,
+                                    capital=capital.value or None)
+                    if len(nuevo.tickers) > MAX_TICKERS:
+                        raise ValueError(f"Máximo {MAX_TICKERS} acciones.")
+                    self.analizar(nuevo)
+                    if self.interactivo:
+                        self.redibujar()
+                        print(f"Listo: {len(self.A.precios.columns)} acciones analizadas. "
+                              f"Baja para ver los resultados.")
+                    else:
+                        print("Listo. En Jupyter, ejecuta las celdas de abajo para ver el nuevo "
+                              "análisis (Run > Run Selected Cell and All Below).")
+                except Exception as e:
+                    print(f"Error: {e}")
+                finally:
+                    boton.disabled, boton.description = False, "Analizar"
+
+        boton.on_click(al_pulsar)
+        ayuda = widgets.HTML(
+            "<b>Escribe las acciones que quieras analizar</b> (símbolos de Yahoo Finance, separados "
+            "por coma) y pulsa <i>Analizar</i>. La descarga y optimización tarda entre 10 y 60 s.")
+        return widgets.VBox([ayuda, tickers,
+                             widgets.HBox([inicio, benchmark, capital]),
+                             boton, estado],
+                            layout=widgets.Layout(border="1px solid #ccc", padding="10px"))
+
+
 # =========================================================================== terminal
 
 def titulo(texto: str) -> None:
@@ -784,24 +944,19 @@ def main() -> None:
     cfg.salida.mkdir(parents=True, exist_ok=True)
 
     try:
-        precios, bench = preparar_precios(cfg)
+        A = analizar(cfg)
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
-    rf = tasa_libre_riesgo(cfg)
-    rend = rendimientos(precios)
-    bench_rend = rendimientos(bench) if bench is not None else None
+    precios, bench, rf, corr, oos, pesos = A.precios, A.bench, A.rf, A.corr, A.oos, A.pesos
+    mu, S, ex_ante, elegido, motivo = A.mu, A.S, A.ex_ante, A.elegido, A.motivo
+    met_act, met_hist = A.met_activos, A.met_hist
     print(f"  Tasa libre de riesgo: {rf:.2%}")
     print(f"  Configuración: mu={cfg.mu}, cov={cfg.cov}, peso máx={cfg.max_peso:.0%}, "
           f"L2 gamma={cfg.gamma}, rebalanceo={cfg.rebalanceo}")
 
     titulo("1. MÉTRICAS POR ACTIVO (periodo completo)")
-    tabla_act = rend.copy()
-    if bench_rend is not None:
-        tabla_act[f"[{bench.name}]"] = bench_rend
-    met_act = tabla_metricas(tabla_act, rf, bench_rend)
     print(formatear(met_act).to_string())
 
-    corr = rend.corr()
     if len(corr) > 1:
         titulo("2. CORRELACIONES")
         altos, bajos = pares_correlacion(corr)
@@ -811,7 +966,6 @@ def main() -> None:
         print(bajos.round(2).to_string())
         print(f"\nCorrelación promedio: {corr.values[np.triu_indices(len(corr), 1)].mean():.2f}")
 
-    oos = validar_fuera_de_muestra(precios, bench, cfg, rf)
     if oos is not None:
         titulo(f"3. VALIDACIÓN FUERA DE MUESTRA\n"
                f"   Entrenamiento: {oos.periodo_train[0]} → {oos.periodo_train[1]}  |  "
@@ -819,16 +973,11 @@ def main() -> None:
         print(formatear(oos.metricas).to_string())
 
     titulo("4. PORTAFOLIOS CON TODO EL HISTORIAL (pesos para invertir hoy)")
-    pesos = construir_portafolios(precios, bench, cfg, rf)
     tabla_pesos = pd.DataFrame(pesos)
     print(tabla_pesos.map(lambda x: f"{x:.1%}" if x > 0 else "-").to_string())
-    mu, S = estimar_mu_S(precios, bench, cfg, rf)
-    ex_ante = desempeño_ex_ante(pesos, mu, S, rf)
     print("\nDesempeño esperado (ex ante; tiende a ser optimista):\n")
     print(formatear(ex_ante).to_string())
-    met_hist = tabla_metricas(simular_todos(rend, pesos, cfg.rebalanceo), rf, bench_rend)
 
-    elegido, motivo = elegir_sugerido(pesos, oos, ex_ante)
     titulo(f"5. PORTAFOLIO SUGERIDO: {elegido}  ({motivo})")
     w = pesos[elegido]
     detalle = pd.DataFrame({"Peso": w, "Contribución al riesgo": contribucion_riesgo(w, S)})
