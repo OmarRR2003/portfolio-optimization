@@ -22,6 +22,9 @@ diversificación, 7 estrategias de construcción y **validación fuera de muestr
 - **Estimación robusta:** covarianza con *shrinkage* de Ledoit-Wolf, límites de peso y regularización L2.
 - **7 estrategias:** igual peso, inversa volatilidad, paridad de riesgo, mínima volatilidad, máximo Sharpe, mínimo CVaR y HRP (*Hierarchical Risk Parity*).
 - **Validación fuera de muestra** con rebalanceo periódico frente al benchmark (SPY).
+- **Simulación Monte Carlo de escenarios futuros:** 2,000 trayectorias por *block bootstrap* con un supuesto
+  de rendimiento conservador (CAPM): escenarios pesimista/mediano/optimista en dinero, probabilidad de perder
+  y caída esperada en el camino, para el horizonte y capital que elijas.
 - **Portafolio final:** contribución al riesgo de cada acción y cuántas acciones comprar según tu capital.
 - **Laboratorios interactivos** para ver cómo cambian los resultados al mover los parámetros.
 - Las interpretaciones (*Tus resultados*) se generan a partir de los datos, así que se actualizan solas.

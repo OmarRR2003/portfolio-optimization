@@ -47,6 +47,8 @@ class Config:
     capital: float | None = None
     salida: Path = Path("resultados")
     min_cobertura: float = 0.90
+    horizonte: float = 5             # años a simular en el Monte Carlo
+    prima_mercado: float = 0.05      # prima de riesgo del mercado para el supuesto conservador
 
     def __post_init__(self):
         if isinstance(self.tickers, str):
@@ -397,6 +399,121 @@ def contribucion_riesgo(w: pd.Series, S: pd.DataFrame) -> pd.Series:
     return pd.Series(w.values * marginal / (w.values @ marginal), index=S.index)
 
 
+# =========================================================================== simulación Monte Carlo
+
+ESCENARIOS = {"Pesimista (5 %)": 5, "Desfavorable (25 %)": 25, "Mediana (50 %)": 50,
+              "Favorable (75 %)": 75, "Optimista (95 %)": 95}
+
+
+def simular_montecarlo(rend_port: pd.Series, capital: float, años: float, n: int = 2000,
+                       bloque: int = 21, semilla: int = 0,
+                       rend_anual: float | None = None) -> np.ndarray:
+    """Trayectorias futuras del valor del portafolio por *block bootstrap*: arma cada futuro
+    pegando bloques de `bloque` días reales consecutivos del historial. Así conserva las caídas
+    bruscas, las rachas de volatilidad y que las acciones se muevan juntas en las crisis, cosas
+    que un modelo normal ignora. Devuelve una matriz (n escenarios × días + 1) en dinero.
+
+    `rend_anual`: si se indica, se recentra el rendimiento promedio en ese valor (manteniendo la
+    volatilidad y las colas). Sin él, se repite el rendimiento promedio histórico."""
+    r = rend_port.dropna().values
+    if rend_anual is not None:
+        r = r - r.mean() + rend_anual / DIAS
+    dias = max(1, int(round(años * DIAS)))
+    bloque = max(1, min(bloque, len(r)))
+    rng = np.random.default_rng(semilla)   # misma semilla = mismos escenarios para cada estrategia
+    n_bloques = -(-dias // bloque)
+    inicios = rng.integers(0, len(r) - bloque + 1, size=(n, n_bloques))
+    idx = (inicios[:, :, None] + np.arange(bloque)).reshape(n, -1)[:, :dias]
+    crecimiento = np.cumprod(1 + r[idx], axis=1)
+    return capital * np.hstack([np.ones((n, 1)), crecimiento])
+
+
+SUPUESTOS_MC = {
+    "conservador": "rendimiento esperado según CAPM (tasa libre de riesgo + beta × prima de mercado)",
+    "historico": "repite el rendimiento promedio del periodo analizado (optimista si fue un buen periodo)",
+}
+
+
+def rendimiento_supuesto(rend_port: pd.Series, bench_rend: pd.Series | None, rf: float,
+                         prima: float) -> float:
+    """CAPM: rf + beta × prima de mercado. Sin benchmark se asume beta = 1."""
+    beta = 1.0
+    if bench_rend is not None:
+        b = bench_rend.reindex(rend_port.index).dropna()
+        r = rend_port.reindex(b.index)
+        if len(b) > 2 and b.var() > 0:
+            beta = float(np.cov(r, b)[0, 1] / b.var())
+    return rf + beta * prima
+
+
+def montecarlo(A: "Analisis", w: pd.Series, capital: float, años: float,
+               supuesto: str = "conservador", n: int = 2000):
+    """Simula un portafolio del análisis A. Devuelve (valores, rendimiento anual supuesto o None)."""
+    rp = simular(A.rend, w, A.cfg.rebalanceo)
+    ra = (rendimiento_supuesto(rp, A.bench_rend, A.rf, A.cfg.prima_mercado)
+          if supuesto == "conservador" else None)
+    return simular_montecarlo(rp, capital, años, n, rend_anual=ra), ra
+
+
+def resumen_montecarlo(valores: np.ndarray, capital: float, años: float,
+                       rf: float) -> tuple[pd.DataFrame, pd.Series]:
+    """Escenarios por percentil y estadísticas de riesgo de la simulación."""
+    final = valores[:, -1]
+    tabla = pd.DataFrame({"Valor final": {k: np.percentile(final, p) for k, p in ESCENARIOS.items()}})
+    tabla["Ganancia / pérdida"] = tabla["Valor final"] - capital
+    tabla["Rend. anual"] = (tabla["Valor final"] / capital).clip(lower=1e-9) ** (1 / años) - 1
+    caidas = (valores / np.maximum.accumulate(valores, axis=1) - 1).min(axis=1)
+    stats = pd.Series({
+        "Probabilidad de perder dinero": (final < capital).mean(),
+        "Probabilidad de ganarle a la tasa libre de riesgo": (final > capital * (1 + rf) ** años).mean(),
+        "Valor final promedio": final.mean(),
+        "Peor caída en el camino (mediana)": np.median(caidas),
+        "Probabilidad de una caída de 30 % o más": (caidas <= -0.30).mean(),
+    })
+    return tabla, stats
+
+
+def comparar_montecarlo(A: "Analisis", capital: float, años: float,
+                        supuesto: str = "conservador", n: int = 2000) -> pd.DataFrame:
+    """Simula todas las estrategias con los mismos escenarios para compararlas de forma justa."""
+    filas = {}
+    for nombre, w in A.pesos.items():
+        v, ra = montecarlo(A, w, capital, años, supuesto, n)
+        t, s = resumen_montecarlo(v, capital, años, A.rf)
+        filas[nombre] = {
+            "Rend. supuesto": ra if ra is not None else np.nan,
+            "Pesimista (5 %)": t.loc["Pesimista (5 %)", "Valor final"],
+            "Mediana (50 %)": t.loc["Mediana (50 %)", "Valor final"],
+            "Optimista (95 %)": t.loc["Optimista (95 %)", "Valor final"],
+            "Prob. de perder": s["Probabilidad de perder dinero"],
+            "Peor caída (mediana)": s["Peor caída en el camino (mediana)"],
+        }
+    return pd.DataFrame(filas).T.sort_values("Pesimista (5 %)", ascending=False)
+
+
+def estilo_montecarlo(tabla: pd.DataFrame):
+    return tabla.style.format({"Valor final": "${:,.0f}", "Ganancia / pérdida": "${:+,.0f}",
+                               "Rend. anual": "{:+.1%}"}).background_gradient(
+        subset=["Ganancia / pérdida"], cmap="RdYlGn")
+
+
+def estilo_riesgo_montecarlo(stats: pd.Series):
+    texto = {k: (f"${v:,.0f}" if "Valor" in k else f"{v:.1%}") for k, v in stats.items()}
+    return pd.DataFrame({"": texto}).style.set_table_styles(
+        [{"selector": "th.col_heading", "props": "display: none;"}])
+
+
+def estilo_comparacion(df: pd.DataFrame):
+    if df["Rend. supuesto"].isna().all():
+        df = df.drop(columns="Rend. supuesto")
+    return df.style.format({"Rend. supuesto": "{:.1%}", "Pesimista (5 %)": "${:,.0f}",
+                            "Mediana (50 %)": "${:,.0f}",
+                            "Optimista (95 %)": "${:,.0f}", "Prob. de perder": "{:.1%}",
+                            "Peor caída (mediana)": "{:.1%}"}).background_gradient(
+        subset=["Pesimista (5 %)", "Mediana (50 %)"], cmap="RdYlGn").background_gradient(
+        subset=["Prob. de perder"], cmap="RdYlGn_r")
+
+
 # =========================================================================== validación
 
 @dataclass
@@ -621,6 +738,38 @@ def graf_drawdown(rend_port: pd.DataFrame, bench: pd.Series | None = None,
     return fig
 
 
+def graf_montecarlo(valores: np.ndarray, capital: float, titulo: str = ""):
+    """Gráfico de abanico: bandas de escenarios en el tiempo + distribución del valor final."""
+    x = np.arange(valores.shape[1]) / DIAS
+    p5, p25, p50, p75, p95 = np.percentile(valores, [5, 25, 50, 75, 95], axis=0)
+    final = valores[:, -1]
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True, layout="constrained",
+                                  gridspec_kw={"width_ratios": [3, 1]})
+    for tray in valores[:40]:
+        ax.plot(x, tray, color="gray", alpha=0.15, lw=0.6)
+    ax.fill_between(x, p5, p95, color="steelblue", alpha=0.18, label="90 % de los escenarios")
+    ax.fill_between(x, p25, p75, color="steelblue", alpha=0.35, label="50 % central")
+    ax.plot(x, p50, color="navy", lw=2.2, label="Mediana")
+    ax.axhline(capital, color="crimson", ls="--", lw=1.3, label="Capital inicial")
+    ax.set(title=titulo or "Simulación Monte Carlo del valor del portafolio",
+           xlabel="Años", ylabel="Valor del portafolio")
+    ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.0f}"))
+    ax.set_ylim(max(0, np.percentile(valores, 1) * 0.9), np.percentile(final, 98) * 1.05)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.3)
+    ax2.hist(final, bins=np.linspace(*ax.get_ylim(), 50), orientation="horizontal",
+             color="steelblue", alpha=0.8)
+    ax2.axhline(capital, color="crimson", ls="--", lw=1.3)
+    for v, txt in ((np.percentile(final, 5), "5 %"), (np.median(final), "Mediana"),
+                   (np.percentile(final, 95), "95 %")):
+        ax2.axhline(v, color="k", lw=0.8, ls=":")
+        ax2.text(0.97, v, txt, transform=ax2.get_yaxis_transform(), fontsize=7,
+                 ha="right", va="bottom")
+    ax2.set(title="Valor final", xlabel="N° de escenarios")
+    ax2.grid(alpha=0.3)
+    return fig
+
+
 def graf_contribucion(w: pd.Series, S: pd.DataFrame, titulo: str = ""):
     cr = contribucion_riesgo(w, S)
     df = pd.DataFrame({"Peso (capital)": w, "Contribución al riesgo": cr})
@@ -735,6 +884,36 @@ def lectura_final(nombre: str, w: pd.Series, S: pd.DataFrame) -> str:
     elif cr.max() > 0.4:
         l.append(f"Una sola acción concentra más del 40 % del riesgo: el portafolio depende mucho de {t_r}.")
     return _nota(l)
+
+
+def _dinero(v: float) -> str:
+    return f"{'-' if v < 0 else '+'}${abs(v):,.0f}"
+
+
+def lectura_montecarlo(nombre: str, tabla: pd.DataFrame, stats: pd.Series,
+                       capital: float, años: float, rend_supuesto: float | None = None) -> str:
+    supuesto = (f"Supuesto: rendimiento esperado de **{rend_supuesto:.1%} anual** (CAPM), con la "
+                f"volatilidad y las caídas reales del historial." if rend_supuesto is not None else
+                "Supuesto: se repite el rendimiento promedio del periodo analizado. Si ese periodo fue "
+                "excepcional, **estos resultados son optimistas**.")
+    med = tabla.loc["Mediana (50 %)"]
+    pes = tabla.loc["Pesimista (5 %)"]
+    opt = tabla.loc["Optimista (95 %)"]
+    p_perder = stats["Probabilidad de perder dinero"]
+    nivel = ("muy baja" if p_perder < 0.05 else "baja" if p_perder < 0.15 else
+             "moderada" if p_perder < 0.30 else "alta")
+    return _nota([
+        supuesto,
+        f"Con **${capital:,.0f}** en *{nombre}* durante **{años:g} años**, el escenario típico (mediana) "
+        f"termina en **${med['Valor final']:,.0f}** ({med['Rend. anual']:+.1%} anual).",
+        f"En el 5 % de escenarios más malos terminarías con **${pes['Valor final']:,.0f}** o menos "
+        f"({_dinero(pes['Ganancia / pérdida'])}); en el 5 % más buenos, con "
+        f"${opt['Valor final']:,.0f} o más.",
+        f"Probabilidad de terminar perdiendo dinero: **{p_perder:.0%}** ({nivel}).",
+        f"En la mitad de los escenarios, en algún momento el portafolio cae **"
+        f"{-stats['Peor caída en el camino (mediana)']:.0%} o más** desde un máximo, aunque termine "
+        f"ganando: hay que estar preparado para aguantarlo sin vender.",
+    ])
 
 
 # =========================================================================== análisis completo
@@ -949,10 +1128,15 @@ def parsear_args() -> Config:
     p.add_argument("--salida", default=str(d.salida), help="Carpeta para CSV y gráficos")
     p.add_argument("--sin-graficos", action="store_true")
     p.add_argument("--min-cobertura", type=float, default=d.min_cobertura)
+    p.add_argument("--horizonte", type=float, default=d.horizonte,
+                   help="Años a simular en el Monte Carlo")
+    p.add_argument("--prima-mercado", type=float, default=d.prima_mercado,
+                   help="Prima de riesgo del mercado para el supuesto conservador del Monte Carlo")
     a = p.parse_args()
     try:
         cfg = Config(a.tickers, a.inicio, a.fin, a.benchmark, a.rf, a.max_peso, a.mu, a.cov,
-                     a.gamma, a.test, a.rebalanceo, a.capital, Path(a.salida), a.min_cobertura)
+                     a.gamma, a.test, a.rebalanceo, a.capital, Path(a.salida), a.min_cobertura,
+                     a.horizonte, a.prima_mercado)
     except ValueError as e:
         p.error(str(e))
     cfg.graficos = not a.sin_graficos
@@ -1017,7 +1201,27 @@ def main() -> None:
         except Exception as e:
             aviso(f"No se pudo calcular la asignación discreta: {e}")
 
+    capital_sim = cfg.capital or 10_000
+    titulo(f"6. SIMULACIÓN MONTE CARLO: {elegido}, ${capital_sim:,.0f} a {cfg.horizonte:g} años "
+           f"(2,000 escenarios)")
+    valores, ra = montecarlo(A, w, capital_sim, cfg.horizonte)
+    print(f"Supuesto conservador: rendimiento esperado {ra:.1%} anual (CAPM, prima de mercado "
+          f"{cfg.prima_mercado:.0%}), con la volatilidad y las caídas reales del historial.\n")
+    mc_tabla, mc_stats = resumen_montecarlo(valores, capital_sim, cfg.horizonte, rf)
+    print(mc_tabla.to_string(formatters={"Valor final": "${:,.0f}".format,
+                                         "Ganancia / pérdida": _dinero,
+                                         "Rend. anual": "{:+.1%}".format}))
+    print()
+    for k, v in mc_stats.items():
+        print(f"  {k:<50} {'$' + format(v, ',.0f') if 'Valor' in k else format(v, '.1%')}")
+    mc_comp = comparar_montecarlo(A, capital_sim, cfg.horizonte)
+    print("\nTodas las estrategias con los mismos escenarios:\n")
+    print(mc_comp.to_string(formatters={c: ("{:.1%}".format if any(k in c for k in ("Prob", "caída", "Rend"))
+                                            else "${:,.0f}".format) for c in mc_comp.columns}))
+
     # Exportar
+    mc_tabla.to_csv(cfg.salida / "montecarlo_escenarios.csv")
+    mc_comp.to_csv(cfg.salida / "montecarlo_comparacion.csv")
     met_act.to_csv(cfg.salida / "metricas_activos.csv")
     corr.to_csv(cfg.salida / "correlacion.csv")
     tabla_pesos.to_csv(cfg.salida / "pesos.csv")
@@ -1040,6 +1244,8 @@ def main() -> None:
             figuras["06_fuera_de_muestra.png"] = graf_crecimiento(
                 oos.rendimientos, oos.benchmark, "Fuera de muestra: crecimiento de 100")
             figuras["07_drawdown.png"] = graf_drawdown(oos.rendimientos, oos.benchmark)
+        figuras["08_montecarlo.png"] = graf_montecarlo(
+            valores, capital_sim, f"{elegido}: {cfg.horizonte:g} años, ${capital_sim:,.0f}")
         for nombre, fig in figuras.items():
             fig.savefig(cfg.salida / nombre, dpi=130)
             plt.close(fig)
