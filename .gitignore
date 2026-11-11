@@ -1,0 +1,13 @@
+# Entorno y caché
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Resultados generados por acciones.py
+resultados/
+
+# Sistema / editores
+.DS_Store
+.vscode/
+.idea/
