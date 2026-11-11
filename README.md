@@ -49,8 +49,7 @@ python acciones.py AAPL MSFT KO XOM --capital 10000   # reporte en terminal + CS
 python acciones.py --help                          # todas las opciones
 ```
 
-## Tecnologías
-
+## Librerias
 Python · pandas · NumPy · SciPy · PyPortfolioOpt · yfinance · matplotlib · ipywidgets · Voilà
 
 ---
